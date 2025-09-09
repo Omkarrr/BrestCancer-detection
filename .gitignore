@@ -22,7 +22,7 @@ wheels/
 MANIFEST
 
 # PyTorch
-*.pth
+# *.pth files are tracked with Git LFS
 *.pt
 
 # Jupyter Notebook
