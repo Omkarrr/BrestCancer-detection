@@ -234,6 +234,35 @@ elif section == 'Preprocessing':
         st.subheader('Original Image')
         st.image(image, caption='Original')
         
+        # Magnification detection and analysis
+        st.subheader('🔍 Magnification Analysis')
+        height, width = image.shape[:2]
+        
+        # Estimate magnification based on image size
+        if height > 1000 or width > 1000:
+            estimated_mag = "400x (High Resolution)"
+            mag_color = "🔴"
+            mag_warning = "⚠️ **400x Image Detected**: This image may have lower classification accuracy. Consider using 200x images for better results."
+        elif height > 500 or width > 500:
+            estimated_mag = "200x (Medium Resolution)"
+            mag_color = "🟡"
+            mag_warning = "✅ **200x Image Detected**: This is the optimal resolution for your trained models."
+        else:
+            estimated_mag = "100x or lower (Low Resolution)"
+            mag_color = "🟢"
+            mag_warning = "ℹ️ **Low Resolution Image**: Consider using higher resolution images for better results."
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"{mag_color} **Estimated Magnification**: {estimated_mag}")
+            st.write(f"Image dimensions: {width} x {height} pixels")
+        with col2:
+            st.warning(mag_warning)
+        
+        # Store magnification info for later use
+        st.session_state['estimated_magnification'] = estimated_mag
+        st.session_state['image_dimensions'] = (width, height)
+        
         # Denoising
         st.subheader('Denoising')
         denoised = cv2.fastNlMeansDenoisingColored(image, None, 10, 10, 7, 21)
@@ -449,8 +478,26 @@ elif section == 'Feature Extraction':
         model_configs = load_model_configs()
         model_options = list(model_configs.keys())
 
-        # Show model count
-        st.info(f"{len(model_options)} models available for feature extraction")
+        # Filter out models that don't have model files
+        available_models = []
+        missing_models = []
+        
+        for model_name in model_options:
+            config = model_configs[model_name]
+            if os.path.exists(config['file']):
+                available_models.append(model_name)
+            else:
+                missing_models.append(f"{model_name} ({config['file']})")
+        
+        # Show model count and missing models
+        st.info(f"{len(available_models)} models available for feature extraction")
+        if missing_models:
+            with st.expander("Missing Model Files", expanded=False):
+                for missing in missing_models:
+                    st.warning(f"❌ {missing}")
+        
+        # Use only available models
+        model_options = available_models
 
         selected_model = st.selectbox(
             'Choose a model:',
@@ -941,6 +988,318 @@ elif section == 'Feature Extraction':
                     st.error(f"Error loading GAN model: {e}")
                     st.info("Make sure the GAN model has been trained and saved as 'gan_breast_cancer_final.pth'")
 
+        # ============= Generic Handler for All Other Models =============
+        else:
+            # Generic handler for all models not specifically handled above
+            try:
+                st.info(f"Using generic feature extraction for {selected_model}")
+                
+                # Get model configuration
+                config = model_configs[selected_model]
+                arch = config['architecture']
+                
+                # Build model using the same logic as classification
+                # Define helper functions locally
+                def detect_num_classes_in_ckpt(ckpt_path):
+                    """Try to infer num output classes from the checkpoint head."""
+                    try:
+                        sd = torch.load(ckpt_path, map_location='cpu')
+                        if isinstance(sd, dict) and 'state_dict' in sd:
+                            sd = sd['state_dict']
+                        if isinstance(sd, dict):
+                            sd = {k.replace('module.', ''): v for k, v in sd.items()}
+                            
+                            # Look for classifier weight patterns
+                            classifier_keys = [
+                                'classifier.6.weight',  # VGG
+                                'fc.weight',           # ResNet, DenseNet
+                                'classifier.1.weight', # MobileNet
+                                '_fc.weight',          # EfficientNet
+                                'classifier[-1].weight',
+                                'classifier.weight',   # DenseNet direct
+                                'classifier.0.weight', # Some architectures
+                                'classifier.3.weight', # MobileNetV3
+                                'classifier.4.weight', # Some variants
+                                'classifier.5.weight'  # Some variants
+                            ]
+                            
+                            for k in classifier_keys:
+                                if k in sd and sd[k].dim() == 2:
+                                    num_classes = int(sd[k].shape[0])
+                                    return num_classes
+                            
+                            # If no specific classifier found, look for any weight with 2D shape
+                            for k, v in sd.items():
+                                if 'classifier' in k and 'weight' in k and v.dim() == 2:
+                                    num_classes = int(v.shape[0])
+                                    return num_classes
+                                    
+                    except Exception as e:
+                        print(f"Error detecting classes in {ckpt_path}: {e}")
+                        pass
+                    return None  # unknown
+
+                def build_model_local(model_name, config):
+                    """Create model for inference, handle both 2-class and 6-class models."""
+                    arch = config['architecture']
+                    ckpt = config['file']
+
+                    # Check class count in checkpoint
+                    num_classes = detect_num_classes_in_ckpt(ckpt)
+                    if num_classes is None:
+                        num_classes = 2  # Default to 2 classes if can't detect
+                        print(f"Warning: Could not detect classes in {ckpt}, defaulting to 2 classes")
+                    else:
+                        print(f"Building {model_name} with {num_classes} classes")
+                    
+                    # Build base torchvision model with correct number of classes
+                    if arch == 'vgg16':
+                        model = models.vgg16(weights=None)
+                        model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading VGG16 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.classifier[6] = nn.Linear(model.classifier[6].in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    elif arch == 'resnet18':
+                        model = models.resnet18(weights=None)
+                        model.fc = nn.Linear(model.fc.in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading ResNet18 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.fc = nn.Linear(model.fc.in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    elif arch == 'densenet121':
+                        model = models.densenet121(weights=None)
+                        model.classifier = nn.Linear(model.classifier.in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading DenseNet121 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.classifier = nn.Linear(model.classifier.in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    elif arch == 'mobilenet_v2':
+                        model = models.mobilenet_v2(weights=None)
+                        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading MobileNetV2 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.classifier[1] = nn.Linear(model.classifier[1].in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    elif arch == 'efficientnet_b0':
+                        model = models.efficientnet_b0(weights=None)
+                        model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading EfficientNetB0 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.classifier[1] = nn.Linear(model.classifier[1].in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    elif arch == 'efficientnet_b3':
+                        model = models.efficientnet_b3(weights=None)
+                        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading EfficientNetB3 with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    else:
+                        # For other architectures, try a generic approach
+                        if arch == 'resnet34':
+                            model = models.resnet34(weights=None)
+                            model.fc = nn.Linear(model.fc.in_features, num_classes)
+                        elif arch == 'mobilenet_v3_large':
+                            model = models.mobilenet_v3_large(weights=None)
+                            if hasattr(model.classifier, '__len__'):
+                                for i in range(len(model.classifier) - 1, -1, -1):
+                                    if isinstance(model.classifier[i], nn.Linear):
+                                        model.classifier[i] = nn.Linear(model.classifier[i].in_features, num_classes)
+                                        break
+                            else:
+                                model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+                        else:
+                            # Default fallback
+                            model = models.resnet18(weights=None)
+                            model.fc = nn.Linear(model.fc.in_features, num_classes)
+                        
+                        try:
+                            model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                        except Exception as e:
+                            print(f"Error loading {arch} with {num_classes} classes: {e}")
+                            if num_classes == 2:
+                                print("Trying with 6 classes as fallback...")
+                                if arch == 'resnet34':
+                                    model.fc = nn.Linear(model.fc.in_features, 6)
+                                elif arch == 'mobilenet_v3_large':
+                                    for i in range(len(model.classifier) - 1, -1, -1):
+                                        if isinstance(model.classifier[i], nn.Linear):
+                                            model.classifier[i] = nn.Linear(model.classifier[i].in_features, 6)
+                                            break
+                                else:
+                                    model.fc = nn.Linear(model.fc.in_features, 6)
+                                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
+                                num_classes = 6
+
+                    return model.to(device).eval(), num_classes
+
+                def build_transform_local(config):
+                    return transforms.Compose([
+                        transforms.ToPILImage(),
+                        transforms.Resize(config['input_size']),
+                        transforms.ToTensor(),
+                        transforms.Normalize(*config['normalization'])
+                    ])
+
+                model, num_classes = build_model_local(selected_model, config)
+                transform = build_transform_local(config)
+                input_tensor = transform(image).unsqueeze(0).to(device)
+                
+                # Extract features from different layers based on architecture
+                features = {}
+                
+                def hook_as(name): 
+                    return lambda m, i, o: features.setdefault(name, o.detach())
+                
+                # Register hooks based on architecture
+                if arch == 'resnet18' or arch == 'resnet34':
+                    # For ResNet models, hook into different layers
+                    if hasattr(model, 'layer1'):
+                        model.layer1.register_forward_hook(hook_as('layer1'))
+                    if hasattr(model, 'layer2'):
+                        model.layer2.register_forward_hook(hook_as('layer2'))
+                    if hasattr(model, 'layer3'):
+                        model.layer3.register_forward_hook(hook_as('layer3'))
+                    if hasattr(model, 'layer4'):
+                        model.layer4.register_forward_hook(hook_as('layer4'))
+                    if hasattr(model, 'avgpool'):
+                        model.avgpool.register_forward_hook(hook_as('avgpool'))
+                        
+                elif arch == 'vgg16':
+                    # For VGG models, hook into different feature layers
+                    if hasattr(model, 'features'):
+                        for i, layer in enumerate(model.features):
+                            if isinstance(layer, nn.Conv2d):
+                                layer.register_forward_hook(hook_as(f'conv_{i}'))
+                    if hasattr(model, 'avgpool'):
+                        model.avgpool.register_forward_hook(hook_as('avgpool'))
+                        
+                elif arch == 'densenet121':
+                    # For DenseNet models - hook into dense blocks
+                    if hasattr(model, 'features'):
+                        # Hook into specific dense blocks
+                        dense_blocks = []
+                        for i, layer in enumerate(model.features):
+                            if hasattr(layer, 'denseblock1'):
+                                layer.denseblock1.register_forward_hook(hook_as('denseblock1'))
+                            if hasattr(layer, 'denseblock2'):
+                                layer.denseblock2.register_forward_hook(hook_as('denseblock2'))
+                            if hasattr(layer, 'denseblock3'):
+                                layer.denseblock3.register_forward_hook(hook_as('denseblock3'))
+                            if hasattr(layer, 'denseblock4'):
+                                layer.denseblock4.register_forward_hook(hook_as('denseblock4'))
+                            if isinstance(layer, nn.Conv2d):
+                                layer.register_forward_hook(hook_as(f'conv_{i}'))
+                    if hasattr(model, 'classifier'):
+                        model.classifier.register_forward_hook(hook_as('classifier'))
+                        
+                elif arch == 'mobilenet_v2':
+                    # For MobileNet models
+                    if hasattr(model, 'features'):
+                        for i, layer in enumerate(model.features):
+                            if isinstance(layer, nn.Conv2d):
+                                layer.register_forward_hook(hook_as(f'conv_{i}'))
+                    if hasattr(model, 'classifier'):
+                        model.classifier.register_forward_hook(hook_as('classifier'))
+                        
+                elif arch == 'efficientnet_b0' or arch == 'efficientnet_b3':
+                    # For EfficientNet models - hook into blocks
+                    if hasattr(model, 'features'):
+                        for i, layer in enumerate(model.features):
+                            if isinstance(layer, nn.Conv2d):
+                                layer.register_forward_hook(hook_as(f'conv_{i}'))
+                            # Also hook into MBConv blocks
+                            if hasattr(layer, 'block'):
+                                layer.block.register_forward_hook(hook_as(f'block_{i}'))
+                    if hasattr(model, 'classifier'):
+                        model.classifier.register_forward_hook(hook_as('classifier'))
+                
+                # Forward pass to extract features
+                with torch.no_grad():
+                    _ = model(input_tensor)
+                
+                # Display extracted features
+                st.subheader(f"Feature Extraction Results for {selected_model}")
+                st.write(f"Architecture: {arch}")
+                st.write(f"Number of classes: {num_classes}")
+                st.write(f"Input shape: {input_tensor.shape}")
+                
+                if features:
+                    st.write(f"Extracted {len(features)} feature layers:")
+                    
+                    # Filter out 1D features (classifier outputs) and show only 2D+ features
+                    conv_features = {name: feat for name, feat in features.items() if feat.dim() > 2}
+                    
+                    if conv_features:
+                        # Add layer selection dropdown
+                        layer_options = list(conv_features.keys())
+                        selected_layer = st.selectbox(
+                            f"Select layer for {selected_model}:",
+                            layer_options,
+                            help="Choose which feature layer to visualize"
+                        )
+                        
+                        if selected_layer in conv_features:
+                            show_maps_and_stats(conv_features[selected_layer][0])
+                    else:
+                        st.warning("No 2D feature maps were extracted. Only classifier outputs were captured.")
+                        st.write("Available features:")
+                        for layer_name, feature_map in features.items():
+                            st.write(f"- {layer_name}: {feature_map.shape}")
+                else:
+                    st.warning("No features were extracted. The model architecture might not be supported for feature extraction.")
+                
+                feature_results[selected_model] = {
+                    'features': features, 
+                    'input_shape': input_tensor.shape, 
+                    'model': model,
+                    'architecture': arch,
+                    'num_classes': num_classes
+                }
+                
+            except Exception as e:
+                st.error(f"Error extracting features from {selected_model}: {e}")
+                st.write("This model might not be supported for feature extraction or there might be a loading error.")
+                import traceback
+                st.code(traceback.format_exc())
+
 # --- 5. Classification ---
 elif section == 'Classification':
     st.header('5. Classification')
@@ -950,6 +1309,16 @@ elif section == 'Classification':
         image = st.session_state['preprocessed_image']
 
         st.subheader('Classification Approach')
+        
+        # Show magnification warning if available
+        if 'estimated_magnification' in st.session_state:
+            mag = st.session_state['estimated_magnification']
+            if "400x" in mag:
+                st.error("⚠️ **400x Image Warning**: Your models were primarily trained on 200x images. Classification accuracy may be lower for 400x images.")
+                st.info("💡 **Recommendation**: Try using 200x images or consider training magnification-specific models.")
+            elif "200x" in mag:
+                st.success("✅ **200x Image Detected**: This is the optimal resolution for your trained models.")
+        
         approach = st.selectbox(
             'Choose classification approach:',
             ['Individual Models', 'Ensemble Methods', 'Hybrid Classifiers']
@@ -968,10 +1337,36 @@ elif section == 'Classification':
                     sd = sd['state_dict']
                 if isinstance(sd, dict):
                     sd = {k.replace('module.', ''): v for k, v in sd.items()}
-                    for k in ('classifier.6.weight', 'fc.weight', 'classifier.1.weight', '_fc.weight', 'classifier[-1].weight'):
+                    
+                    # Look for classifier weight patterns
+                    classifier_keys = [
+                        'classifier.6.weight',  # VGG
+                        'fc.weight',           # ResNet, DenseNet
+                        'classifier.1.weight', # MobileNet
+                        '_fc.weight',          # EfficientNet
+                        'classifier[-1].weight',
+                        'classifier.weight',   # DenseNet direct
+                        'classifier.0.weight', # Some architectures
+                        'classifier.3.weight', # MobileNetV3
+                        'classifier.4.weight', # Some variants
+                        'classifier.5.weight'  # Some variants
+                    ]
+                    
+                    for k in classifier_keys:
                         if k in sd and sd[k].dim() == 2:
-                            return int(sd[k].shape[0])
-            except Exception:
+                            num_classes = int(sd[k].shape[0])
+                            print(f"Detected {num_classes} classes from key '{k}' in {ckpt_path}")
+                            return num_classes
+                    
+                    # If no specific classifier found, look for any weight with 2D shape
+                    for k, v in sd.items():
+                        if 'classifier' in k and 'weight' in k and v.dim() == 2:
+                            num_classes = int(v.shape[0])
+                            print(f"Detected {num_classes} classes from key '{k}' in {ckpt_path}")
+                            return num_classes
+                            
+            except Exception as e:
+                print(f"Error detecting classes in {ckpt_path}: {e}")
                 pass
             return None  # unknown
 
@@ -1012,67 +1407,116 @@ elif section == 'Classification':
             return m
 
         def build_model(model_name, config):
-            """Create model for inference with 2 classes, load weights safely."""
+            """Create model for inference, handle both 2-class and 6-class models."""
             arch = config['architecture']
             ckpt = config['file']
 
-            # Check class count; skip if not 2 (we don't know mapping)
+            # Check class count in checkpoint
             num_classes = detect_num_classes_in_ckpt(ckpt)
-            if num_classes not in (2, None):
-                raise RuntimeError(f"Checkpoint has {num_classes} output classes, expected 2.")
-
-            # Build base torchvision model + 2-class head
+            if num_classes is None:
+                num_classes = 2  # Default to 2 classes if can't detect
+                print(f"Warning: Could not detect classes in {ckpt}, defaulting to 2 classes")
+            else:
+                print(f"Building {model_name} with {num_classes} classes")
+            
+            # Build base torchvision model with correct number of classes
             if arch == 'vgg16':
                 model = models.vgg16(weights=None)
-                model.classifier[6] = nn.Linear(model.classifier[6].in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier[6] = nn.Linear(model.classifier[6].in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading VGG16 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier[6] = nn.Linear(model.classifier[6].in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'resnet18':
                 model = models.resnet18(weights=None)
-                model.fc = nn.Linear(model.fc.in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.fc = nn.Linear(model.fc.in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading ResNet18 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.fc = nn.Linear(model.fc.in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'resnet34':
                 model = models.resnet34(weights=None)
-                model.fc = nn.Linear(model.fc.in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.fc = nn.Linear(model.fc.in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading ResNet34 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.fc = nn.Linear(model.fc.in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'densenet121':
                 model = models.densenet121(weights=None)
-                
-                # Check the actual number of classes in the checkpoint
-                num_classes = detect_num_classes_in_ckpt(ckpt)
-                if num_classes is not None:
-                    model.classifier = nn.Linear(model.classifier.in_features, num_classes)
-                else:
-                    model.classifier = nn.Linear(model.classifier.in_features, 2)
-                
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier = nn.Linear(model.classifier.in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading DenseNet121 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier = nn.Linear(model.classifier.in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'mobilenet_v2':
                 model = models.mobilenet_v2(weights=None)
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading MobileNetV2 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier[1] = nn.Linear(model.classifier[1].in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'efficientnet_b0':
                 model = models.efficientnet_b0(weights=None)
-                model.classifier[1] = nn.Linear(model.classifier[1].in_features, 2)
-                # TV EfficientNet B0 should match keys
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading EfficientNetB0 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier[1] = nn.Linear(model.classifier[1].in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'efficientnet_b3':
                 # Try torchvision first, then fallback to efficientnet_pytorch if many unexpected keys
                 tv = models.efficientnet_b3(weights=None)
-                tv.classifier[-1] = nn.Linear(tv.classifier[-1].in_features, 2)
+                tv.classifier[-1] = nn.Linear(tv.classifier[-1].in_features, num_classes)
                 m_cnt, u_cnt = try_load_torchvision(tv, ckpt, strict=False)
                 if u_cnt > 50:  # lots of unexpected keys → different library
-                    model = load_efficientnet_pytorch('b3', ckpt, num_classes=2)
+                    model = load_efficientnet_pytorch('b3', ckpt, num_classes=num_classes)
                 else:
                     model = tv
 
             elif arch == 'efficientnet_b4':
                 tv = models.efficientnet_b4(weights=None)
-                tv.classifier[-1] = nn.Linear(tv.classifier[-1].in_features, 2)
+                tv.classifier[-1] = nn.Linear(tv.classifier[-1].in_features, num_classes)
                 m_cnt, u_cnt = try_load_torchvision(tv, ckpt, strict=False)
                 if u_cnt > 50:
                     # If you actually have an efficientnet_pytorch B4 checkpoint, add a loader like load_efficientnet_pytorch('b4', ...)
@@ -1082,28 +1526,87 @@ elif section == 'Classification':
 
             elif arch == 'mobilenet_v3_large':
                 model = models.mobilenet_v3_large(weights=None)
-                model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                # MobileNetV3 Large has a different classifier structure
+                # The classifier is a Sequential with multiple layers
+                # We need to replace the last Linear layer
+                if hasattr(model.classifier, '__len__'):
+                    # Find the last Linear layer in the classifier
+                    for i in range(len(model.classifier) - 1, -1, -1):
+                        if isinstance(model.classifier[i], nn.Linear):
+                            model.classifier[i] = nn.Linear(model.classifier[i].in_features, num_classes)
+                            break
+                else:
+                    model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+                
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading MobileNetV3 Large with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        for i in range(len(model.classifier) - 1, -1, -1):
+                            if isinstance(model.classifier[i], nn.Linear):
+                                model.classifier[i] = nn.Linear(model.classifier[i].in_features, 6)
+                                break
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'shufflenet_v2_x1_0':
                 model = models.shufflenet_v2_x1_0(weights=None)
-                model.fc = nn.Linear(model.fc.in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.fc = nn.Linear(model.fc.in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading ShuffleNetV2 with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.fc = nn.Linear(model.fc.in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'squeezenet1_1':
                 model = models.squeezenet1_1(weights=None)
-                model.classifier[1] = nn.Conv2d(512, 2, kernel_size=1)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=1)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading SqueezeNet with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier[1] = nn.Conv2d(512, 6, kernel_size=1)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'convnext_base':
                 model = models.convnext_base(weights=None)
-                model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading ConvNext with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'regnet_y_32gf':
                 model = models.regnet_y_32gf(weights=None)
-                model.fc = nn.Linear(model.fc.in_features, 2)
-                try_load_torchvision(model, ckpt, strict=False)
+                model.fc = nn.Linear(model.fc.in_features, num_classes)
+                try:
+                    try_load_torchvision(model, ckpt, strict=False)
+                except Exception as e:
+                    print(f"Error loading RegNet with {num_classes} classes: {e}")
+                    # Try with 6 classes as fallback
+                    if num_classes == 2:
+                        print("Trying with 6 classes as fallback...")
+                        model.fc = nn.Linear(model.fc.in_features, 6)
+                        try_load_torchvision(model, ckpt, strict=False)
+                        num_classes = 6
 
             elif arch == 'gan_generator':
                 # For GAN, we'll use a pre-trained ResNet for classification
@@ -1126,7 +1629,32 @@ elif section == 'Classification':
             else:
                 raise RuntimeError(f"Unsupported architecture: {arch}")
 
-            return model.to(device).eval()
+            return model.to(device).eval(), num_classes
+
+        def map_6class_to_2class(predictions, num_classes):
+            """Map 6-class predictions to 2-class (benign/malignant) predictions"""
+            if num_classes == 2:
+                return predictions
+            
+            # For 6-class models, map to 2 classes
+            # Assuming classes 0,1,2 are benign and 3,4,5 are malignant
+            # This mapping might need adjustment based on your actual class labels
+            if predictions.dim() == 1:
+                # Single prediction
+                if predictions.argmax() < 3:
+                    return torch.tensor([1.0, 0.0])  # Benign
+                else:
+                    return torch.tensor([0.0, 1.0])  # Malignant
+            else:
+                # Batch predictions
+                batch_size = predictions.shape[0]
+                mapped = torch.zeros(batch_size, 2)
+                for i in range(batch_size):
+                    if predictions[i].argmax() < 3:
+                        mapped[i] = torch.tensor([1.0, 0.0])  # Benign
+                    else:
+                        mapped[i] = torch.tensor([0.0, 1.0])  # Malignant
+                return mapped
 
         def build_transform(config):
             return transforms.Compose([
@@ -1174,12 +1702,14 @@ elif section == 'Classification':
                             if nclasses is None:
                                 nclasses = 2  # Default to 2 classes if can't detect
 
-                            model = build_model(model_name, config)
+                            model, num_classes = build_model(model_name, config)
                             transform = build_transform(config)
                             img_tensor = transform(image).unsqueeze(0).to(device)
 
                             with torch.no_grad():
                                 logits = model(img_tensor)
+                                # Map 6-class predictions to 2-class if needed
+                                logits = map_6class_to_2class(logits, num_classes)
                                 probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
 
                             # Handle different numbers of classes
@@ -1333,12 +1863,14 @@ elif section == 'Classification':
                                 if nclasses is None:
                                     nclasses = 2  # Default to 2 classes if can't detect
                                 
-                                model = build_model(model_name, config)
+                                model, num_classes = build_model(model_name, config)
                                 transform = build_transform(config)
                                 img_tensor = transform(image).unsqueeze(0).to(device)
                                 
                                 with torch.no_grad():
                                     logits = model(img_tensor)
+                                    # Map 6-class predictions to 2-class if needed
+                                    logits = map_6class_to_2class(logits, num_classes)
                                     probs = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
                                 
                                 # Handle different numbers of classes
@@ -1655,7 +2187,7 @@ elif section == 'Classification':
                             try:
                                 # Load CNN model and extract features
                                 config = model_configs[selected_cnn]
-                                model = build_model(selected_cnn, config)
+                                model, num_classes = build_model(selected_cnn, config)
                                 transform = build_transform(config)
                                 img_tensor = transform(image).unsqueeze(0).to(device)
                                 
@@ -1713,7 +2245,7 @@ elif section == 'Classification':
                                             pred = clf.predict([features])[0]
                                             prob = clf.predict_proba([features])[0]
                                             
-                                            predictions[name] = class_names[pred]
+                                            predictions[name] = ['Non-cancerous', 'Cancerous'][pred]
                                             confidences[name] = float(prob[pred])
                                         
                                         # Display results

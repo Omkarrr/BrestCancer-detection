@@ -5,13 +5,9 @@ This script trains a DCGAN to generate synthetic breast cancer histopathology im
 """
 
 import os
-import sys
 import argparse
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-import matplotlib.pyplot as plt
-import numpy as np
 from gan_models import BreastCancerGAN, BreastCancerDataset, get_transforms
 
 def create_sample_data():
