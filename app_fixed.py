@@ -294,7 +294,16 @@ elif section == 'Segmentation':
                 with torch.no_grad():
                     mask = unet(img_tensor)
                     mask = torch.sigmoid(mask)
-                    mask = (mask > 0.5).float()
+                    
+                    # Store raw mask for debugging
+                    raw_mask = mask.squeeze().cpu().numpy()
+                    
+                    # Apply thresholding with adjustable threshold
+                    # Calculate a better default threshold based on the raw mask statistics
+                    suggested_threshold = min(0.7, max(0.3, raw_mask.mean() - 0.1))
+                    threshold = st.slider('Segmentation Threshold', 0.1, 0.9, suggested_threshold, 0.05, 
+                                        help='Adjust threshold for segmentation sensitivity. Higher values = more selective')
+                    mask = (mask > threshold).float()
                 
                 # Convert mask to numpy
                 mask_np = mask.squeeze().cpu().numpy()
@@ -313,6 +322,114 @@ elif section == 'Segmentation':
                         mask_rgb = mask_np
                     
                     st.image(mask_rgb, caption='Segmentation Mask')
+                    
+                    # Add multiple visualization options
+                    st.subheader("🎨 Visualization Options")
+                    
+                    col_viz1, col_viz2 = st.columns(2)
+                    
+                    with col_viz1:
+                        if st.checkbox('Show Enhanced Mask Visualization'):
+                            # Create a more visible mask with better contrast
+                            enhanced_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+                            enhanced_mask[mask_np > 0] = [255, 0, 0]  # Red for tissue
+                            enhanced_mask[mask_np == 0] = [0, 0, 0]   # Black for background
+                            
+                            # Add a border for better visibility
+                            enhanced_mask[0, :] = [255, 255, 255]  # Top border
+                            enhanced_mask[-1, :] = [255, 255, 255]  # Bottom border
+                            enhanced_mask[:, 0] = [255, 255, 255]  # Left border
+                            enhanced_mask[:, -1] = [255, 255, 255]  # Right border
+                            
+                            st.image(enhanced_mask, caption='Enhanced Mask: Red=Tissue, Black=Background')
+                    
+                    with col_viz2:
+                        if st.checkbox('Show Colorful Mask'):
+                            # Create a colorful mask with different colors
+                            colorful_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+                            colorful_mask[mask_np > 0] = [0, 255, 0]  # Green for tissue
+                            colorful_mask[mask_np == 0] = [50, 50, 50]  # Dark gray for background
+                            
+                            # Add gradient effect
+                            for i in range(mask_np.shape[0]):
+                                for j in range(mask_np.shape[1]):
+                                    if mask_np[i, j] > 0:
+                                        # Create a gradient effect
+                                        intensity = int(mask_np[i, j] * 255)
+                                        colorful_mask[i, j] = [0, intensity, 255 - intensity]
+                            
+                            st.image(colorful_mask, caption='Colorful Mask: Green=Tissue, Gray=Background')
+                    
+                    # Additional visualization options
+                    if st.checkbox('Show Heatmap Visualization'):
+                        # Create a heatmap-style visualization
+                        import matplotlib.pyplot as plt
+                        import matplotlib.cm as cm
+                        
+                        fig, ax = plt.subplots(figsize=(6, 6))
+                        im = ax.imshow(mask_np, cmap='hot', interpolation='nearest')
+                        ax.set_title('Segmentation Heatmap')
+                        ax.axis('off')
+                        
+                        # Add colorbar
+                        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                        cbar.set_label('Tissue Probability')
+                        
+                        st.pyplot(fig)
+                        plt.close()
+                    
+                    if st.checkbox('Show Contour Visualization'):
+                        # Create contour visualization
+                        contour_mask = np.zeros((mask_np.shape[0], mask_np.shape[1], 3), dtype=np.uint8)
+                        contour_mask[:, :] = [240, 240, 240]  # Light gray background
+                        
+                        # Find contours
+                        contours, _ = cv2.findContours((mask_np * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        # Draw contours in bright colors
+                        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+                        for i, contour in enumerate(contours):
+                            color = colors[i % len(colors)]
+                            cv2.drawContours(contour_mask, [contour], -1, color, 2)
+                        
+                        st.image(contour_mask, caption='Contour Visualization: Colored contours show tissue boundaries')
+                    
+                    # Add overlay visualization
+                    if st.checkbox('Show Overlay on Original Image'):
+                        # Create overlay by blending original image with mask
+                        overlay = image.copy()
+                        if len(overlay.shape) == 3:
+                            # Convert to numpy if it's a PIL image
+                            overlay = np.array(overlay)
+                        
+                        # Resize mask to match original image dimensions
+                        from skimage.transform import resize
+                        mask_resized = resize(mask_np, (overlay.shape[0], overlay.shape[1]), 
+                                            anti_aliasing=False, preserve_range=True)
+                        
+                        # Create colored mask (red for tissue)
+                        colored_mask = np.zeros_like(overlay)
+                        colored_mask[:, :, 0] = mask_resized * 255  # Red channel
+                        
+                        # Blend original image with colored mask
+                        alpha = 0.3  # Transparency
+                        overlay = (1 - alpha) * overlay + alpha * colored_mask
+                        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+                        
+                        st.image(overlay, caption='Overlay: Red = Detected Tissue')
+                
+                # Add debugging information
+                st.write(f"**Debug Info:**")
+                st.write(f"- Raw mask range: [{raw_mask.min():.3f}, {raw_mask.max():.3f}]")
+                st.write(f"- Raw mask mean: {raw_mask.mean():.3f}")
+                st.write(f"- Threshold used: {threshold}")
+                st.write(f"- Mask pixels > threshold: {(mask_np > 0).sum()} / {mask_np.size}")
+                
+                # Show raw mask for comparison
+                if st.checkbox('Show Raw Mask (before thresholding)'):
+                    raw_mask_display = (raw_mask * 255).astype(np.uint8)
+                    raw_mask_rgb = np.stack([raw_mask_display, raw_mask_display, raw_mask_display], axis=-1)
+                    st.image(raw_mask_rgb, caption='Raw Mask (before thresholding)')
                 
                 st.caption('U-Net segmentation identifies tissue regions of interest.')
         else:
