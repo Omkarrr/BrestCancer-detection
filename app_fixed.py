@@ -26,6 +26,12 @@ try:
 except ImportError:
     GAN_AVAILABLE = False
 
+# Global model cache to prevent rebuilding models
+MODEL_CACHE = {}
+
+# Global image tensor cache to ensure consistent preprocessing
+IMAGE_TENSOR_CACHE = {}
+
 st.title('Breast Cancer Detection')
 
 st.sidebar.header('Navigation')
@@ -1411,6 +1417,12 @@ elif section == 'Classification':
             arch = config['architecture']
             ckpt = config['file']
 
+            # Check if model is already cached
+            cache_key = f"{model_name}_{arch}_{ckpt}"
+            if cache_key in MODEL_CACHE:
+                print(f"Using cached model: {model_name}")
+                return MODEL_CACHE[cache_key]
+
             # Check class count in checkpoint
             num_classes = detect_num_classes_in_ckpt(ckpt)
             if num_classes is None:
@@ -1614,21 +1626,32 @@ elif section == 'Classification':
                 if GAN_AVAILABLE:
                     gan = BreastCancerGAN(device=device)
                     gan.load_models(ckpt)
+                    
                     # Use a pre-trained ResNet for medical classification
-                    model = models.resnet18(weights=None)
-                    model.fc = nn.Linear(model.fc.in_features, 2)
-                    # Load a pre-trained breast cancer model if available
-                    try:
-                        if os.path.exists('models/resnet18_breast_cancer.pth'):
-                            model.load_state_dict(torch.load('models/resnet18_breast_cancer.pth', map_location=device))
-                    except:
-                        pass  # Use random weights if no pre-trained model
+                    # Try to load a pre-trained breast cancer model first
+                    if os.path.exists('models/resnet18_breast_cancer_optimized.pth'):
+                        model = models.resnet18(weights=None)
+                        model.fc = nn.Linear(model.fc.in_features, 2)
+                        model.load_state_dict(torch.load('models/resnet18_breast_cancer_optimized.pth', map_location=device))
+                        print("Loaded pre-trained ResNet18 for GAN classification")
+                    elif os.path.exists('models/resnet18_breast_cancer.pth'):
+                        model = models.resnet18(weights=None)
+                        model.fc = nn.Linear(model.fc.in_features, 2)
+                        model.load_state_dict(torch.load('models/resnet18_breast_cancer.pth', map_location=device))
+                        print("Loaded pre-trained ResNet18 for GAN classification")
+                    else:
+                        # Use ImageNet pre-trained weights as fallback
+                        model = models.resnet18(weights='IMAGENET1K_V1')
+                        model.fc = nn.Linear(model.fc.in_features, 2)
+                        print("Using ImageNet pre-trained ResNet18 for GAN classification")
                 else:
                     raise RuntimeError("GAN models not available")
 
             else:
                 raise RuntimeError(f"Unsupported architecture: {arch}")
 
+            # Cache the model for future use
+            MODEL_CACHE[cache_key] = (model.to(device).eval(), num_classes)
             return model.to(device).eval(), num_classes
 
         def map_6class_to_2class(predictions, num_classes):
@@ -1704,7 +1727,18 @@ elif section == 'Classification':
 
                             model, num_classes = build_model(model_name, config)
                             transform = build_transform(config)
-                            img_tensor = transform(image).unsqueeze(0).to(device)
+                            
+                            # Cache the preprocessed image tensor to ensure consistency
+                            image_hash = hash(str(image.tobytes()))
+                            tensor_cache_key = f"{image_hash}_{config['input_size']}_{config['normalization']}"
+                            
+                            if tensor_cache_key in IMAGE_TENSOR_CACHE:
+                                img_tensor = IMAGE_TENSOR_CACHE[tensor_cache_key]
+                                print(f"Using cached tensor for {model_name}")
+                            else:
+                                img_tensor = transform(image).unsqueeze(0).to(device)
+                                IMAGE_TENSOR_CACHE[tensor_cache_key] = img_tensor
+                                print(f"Created new tensor for {model_name}")
 
                             with torch.no_grad():
                                 logits = model(img_tensor)
