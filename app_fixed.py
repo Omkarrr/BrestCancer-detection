@@ -2682,15 +2682,15 @@ elif section == 'Staging':
                 st.write(f"**Confidence Range**: {min(confidences):.1%} - {max(confidences):.1%}")
             
             # Clinical Notes
-            st.write("---")
-            st.subheader("Clinical Notes")
-            st.info("""
-            **Important Disclaimer:**
-            - This staging assessment is based on image analysis and should be used as a preliminary assessment
-            - Final staging requires comprehensive clinical evaluation, imaging studies, and pathology
-            - Always consult with qualified healthcare professionals for definitive diagnosis and treatment planning
-            - This tool is for educational and research purposes only
-            """)
+            # st.write("---")
+            # st.subheader("Clinical Notes")
+            # st.info("""
+            # **Important Disclaimer:**
+            # - This staging assessment is based on image analysis and should be used as a preliminary assessment
+            # - Final staging requires comprehensive clinical evaluation, imaging studies, and pathology
+            # - Always consult with qualified healthcare professionals for definitive diagnosis and treatment planning
+            # - This tool is for educational and research purposes only
+            # """)
             
             # Export Results
             if st.button("Export Staging Report"):
