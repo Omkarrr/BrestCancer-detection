@@ -246,15 +246,10 @@ elif section == 'Preprocessing':
         
         # Estimate magnification based on image size
         if height > 1000 or width > 1000:
-            estimated_mag = "400x (High Resolution)"
             mag_color = "🔴"
-            mag_warning = "⚠️ **400x Image Detected**: This image may have lower classification accuracy. Consider using 200x images for better results."
         elif height > 500 or width > 500:
-            estimated_mag = "200x (Medium Resolution)"
             mag_color = "🟡"
-            mag_warning = "✅ **200x Image Detected**: This is the optimal resolution for your trained models."
         else:
-            estimated_mag = "100x or lower (Low Resolution)"
             mag_color = "🟢"
             mag_warning = "ℹ️ **Low Resolution Image**: Consider using higher resolution images for better results."
         
@@ -1327,7 +1322,8 @@ elif section == 'Classification':
         
         approach = st.selectbox(
             'Choose classification approach:',
-            ['Individual Models', 'Ensemble Methods', 'Hybrid Classifiers']
+            ['Individual Models', 'Ensemble Methods']
+            # ['Individual Models', 'Ensemble Methods', 'Hybrid Classifiers']
         )
 
         # ---------- helpers ----------
@@ -2177,7 +2173,6 @@ elif section == 'Classification':
                         if agreement:
                             st.success("**Model Agreement**: All models agree on the prediction")
                         else:
-                            st.warning("**Model Disagreement**: Models have different predictions")
                             st.write(f"**Agreement Rate**: {max(model_predictions.count(0), model_predictions.count(1)) / len(model_predictions):.1%}")
                         
                     else:
